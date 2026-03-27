@@ -61,11 +61,8 @@ function getDevice(userAgent = "") {
 
 // ── Analyze route ─────────────────────────────────────────────────────────
 app.post("/analyze", async (req, res) => {
-  const { prompt, state } = req.body;
+  const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: "No prompt provided" });
-
-  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
-  const device = getDevice(req.headers["user-agent"]);
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -83,48 +80,54 @@ app.post("/analyze", async (req, res) => {
     });
 
     const data = await response.json();
-
-    // Parse and log the result
-    try {
-      const text = data.content.map(i => i.text || "").join("\n");
-      const clean = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
-      const region = await getRegion(ip);
-
-      const info = insertAnalysis.run({
-        timestamp: new Date().toISOString(),
-        ip,
-        region: region || null,
-        state: state || null,
-        device,
-        avg_grade: parsed.averageGrade,
-        avg_label: parsed.averageLabel,
-        percentile: parsed.percentile,
-        percentile_label: parsed.percentileLabel,
-        assessment: parsed.assessment
-      });
-
-      const logBooks = db.transaction((books) => {
-        for (const book of books) {
-          insertBook.run({
-            analysis_id: info.lastInsertRowid,
-            title: book.title,
-            author: book.author || null,
-            grade_level: book.gradeLevel,
-            level_label: book.levelLabel
-          });
-        }
-      });
-
-      logBooks(parsed.books);
-    } catch (logErr) {
-      console.error("Logging error:", logErr);
-    }
-
     res.json(data);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "API call failed" });
+  }
+});
+
+// ── Log route — receives computed stats from frontend ─────────────────────
+app.post("/log", async (req, res) => {
+  const { state, weightedAvg, percentile, books } = req.body;
+  if (!books || !Array.isArray(books)) return res.status(400).json({ error: "No books provided" });
+
+  const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+  const device = getDevice(req.headers["user-agent"]);
+
+  try {
+    const region = await getRegion(ip);
+
+    const info = insertAnalysis.run({
+      timestamp: new Date().toISOString(),
+      ip,
+      region: region || null,
+      state: state || null,
+      device,
+      avg_grade: weightedAvg || null,
+      avg_label: weightedAvg ? `grade ${weightedAvg}` : null,
+      percentile: percentile || null,
+      percentile_label: percentile ? `${percentile}th percentile` : null,
+      assessment: null
+    });
+
+    const logBooks = db.transaction((bks) => {
+      for (const book of bks) {
+        insertBook.run({
+          analysis_id: info.lastInsertRowid,
+          title: book.title,
+          author: book.author || null,
+          grade_level: book.gradeLevel,
+          level_label: book.levelLabel
+        });
+      }
+    });
+
+    logBooks(books);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Log error:", err);
+    res.status(500).json({ error: "Logging failed" });
   }
 });
 
