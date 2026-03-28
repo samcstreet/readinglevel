@@ -1,50 +1,27 @@
 const express = require("express");
 const cors = require("cors");
-const Database = require("better-sqlite3");
+const fs = require("fs");
 const path = require("path");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Database setup ────────────────────────────────────────────────────────
-const db = new Database(path.join(__dirname, "responses.db"));
+// ── Storage ───────────────────────────────────────────────────────────────
+const DB_PATH = path.join(__dirname, "data.json");
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS analyses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    ip TEXT,
-    region TEXT,
-    state TEXT,
-    device TEXT,
-    avg_grade REAL,
-    avg_label TEXT,
-    percentile INTEGER,
-    percentile_label TEXT,
-    assessment TEXT
-  );
+function readDB() {
+  try {
+    if (!fs.existsSync(DB_PATH)) return { entries: [] };
+    return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+  } catch {
+    return { entries: [] };
+  }
+}
 
-  CREATE TABLE IF NOT EXISTS books (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    analysis_id INTEGER NOT NULL,
-    title TEXT,
-    author TEXT,
-    grade_level REAL,
-    level_label TEXT,
-    FOREIGN KEY (analysis_id) REFERENCES analyses(id)
-  );
-`);
-
-const insertAnalysis = db.prepare(`
-  INSERT INTO analyses (timestamp, ip, region, state, device, avg_grade, avg_label, percentile, percentile_label, assessment)
-  VALUES (@timestamp, @ip, @region, @state, @device, @avg_grade, @avg_label, @percentile, @percentile_label, @assessment)
-`);
-
-const insertBook = db.prepare(`
-  INSERT INTO books (analysis_id, title, author, grade_level, level_label)
-  VALUES (@analysis_id, @title, @author, @grade_level, @level_label)
-`);
+function writeDB(db) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function getRegion(ip) {
@@ -87,43 +64,30 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
-// ── Log route — receives computed stats from frontend ─────────────────────
+// ── Log route ─────────────────────────────────────────────────────────────
 app.post("/log", async (req, res) => {
   const { state, weightedAvg, percentile, books } = req.body;
-  if (!books || !Array.isArray(books)) return res.status(400).json({ error: "No books provided" });
+  if (!books || !Array.isArray(books)) return res.status(400).json({ error: "No books" });
 
   const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
   const device = getDevice(req.headers["user-agent"]);
 
   try {
     const region = await getRegion(ip);
+    const db = readDB();
 
-    const info = insertAnalysis.run({
+    db.entries.push({
       timestamp: new Date().toISOString(),
       ip,
       region: region || null,
       state: state || null,
       device,
-      avg_grade: weightedAvg || null,
-      avg_label: weightedAvg ? `grade ${weightedAvg}` : null,
+      weightedAvg: weightedAvg || null,
       percentile: percentile || null,
-      percentile_label: percentile ? `${percentile}th percentile` : null,
-      assessment: null
+      books
     });
 
-    const logBooks = db.transaction((bks) => {
-      for (const book of bks) {
-        insertBook.run({
-          analysis_id: info.lastInsertRowid,
-          title: book.title,
-          author: book.author || null,
-          grade_level: book.gradeLevel,
-          level_label: book.levelLabel
-        });
-      }
-    });
-
-    logBooks(books);
+    writeDB(db);
     res.json({ ok: true });
   } catch (err) {
     console.error("Log error:", err);
@@ -131,42 +95,35 @@ app.post("/log", async (req, res) => {
   }
 });
 
-// ── CSV export (password protected) ──────────────────────────────────────
+// ── CSV export ────────────────────────────────────────────────────────────
 app.get("/export", (req, res) => {
   const password = process.env.EXPORT_PASSWORD || "readingscore";
-  if (req.query.password !== password) {
-    return res.status(401).send("Unauthorized");
+  if (req.query.password !== password) return res.status(401).send("Unauthorized");
+
+  const db = readDB();
+
+  const headers = ["Timestamp", "State", "Region", "Device", "Weighted Avg Grade", "Percentile", "Title", "Author", "Book Grade", "Book Level"];
+
+  const rows = [];
+  for (const entry of db.entries) {
+    if (!entry.books || entry.books.length === 0) continue;
+    for (const book of entry.books) {
+      rows.push([
+        entry.timestamp,
+        entry.state || "",
+        entry.region || "",
+        entry.device || "",
+        entry.weightedAvg || "",
+        entry.percentile || "",
+        `"${(book.title || "").replace(/"/g, '""')}"`,
+        `"${(book.author || "").replace(/"/g, '""')}"`,
+        book.gradeLevel || "",
+        book.levelLabel || ""
+      ].join(","));
+    }
   }
 
-  const rows = db.prepare(`
-    SELECT
-      a.timestamp, a.state, a.region, a.device,
-      a.avg_grade, a.avg_label, a.percentile, a.percentile_label,
-      a.assessment,
-      b.title, b.author, b.grade_level, b.level_label
-    FROM analyses a
-    LEFT JOIN books b ON b.analysis_id = a.id
-    ORDER BY a.id DESC
-  `).all();
-
-  const headers = [
-    "Timestamp", "State", "Region", "Device",
-    "Avg Grade", "Avg Label", "Percentile", "Percentile Label",
-    "Assessment", "Title", "Author", "Book Grade", "Book Level"
-  ];
-
-  const csv = [
-    headers.join(","),
-    ...rows.map(r => [
-      r.timestamp, r.state || "", r.region || "", r.device || "",
-      r.avg_grade, r.avg_label || "", r.percentile, r.percentile_label || "",
-      `"${(r.assessment || "").replace(/"/g, '""')}"`,
-      `"${(r.title || "").replace(/"/g, '""')}"`,
-      `"${(r.author || "").replace(/"/g, '""')}"`,
-      r.grade_level, r.level_label || ""
-    ].join(","))
-  ].join("\n");
-
+  const csv = [headers.join(","), ...rows].join("\n");
   res.setHeader("Content-Type", "text/csv");
   res.setHeader("Content-Disposition", `attachment; filename="readingscore-${Date.now()}.csv"`);
   res.send(csv);
